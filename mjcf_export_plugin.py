@@ -23,7 +23,7 @@ bl_info = {
 
 
 class MuJoCoExportOperator(Operator, ExportHelper):
-    """ 
+    """
     Builds an MJCF file from the scene hierarchy.
     """
     bl_idname = "export_scene.mjcf_export"  # ID name of the operator
@@ -71,14 +71,79 @@ def write_mjcf(dir_path, model_file_name, selected_objects, export=False):
 
         # Write the MJCF header
         file.write('<mujoco>\n')
-        file.write('  <compiler meshdir="./mesh"/>\n')
+        file.write('  <compiler angle="radian" meshdir="assets" autolimits="true" />\n')
+
+        file.write('  <visual>\n')
+        file.write('    <headlight diffuse="0.5 0.5 0.5" ambient="0.6 0.6 0.6" specular="0 0 0" />\n')
+        file.write('    <rgba haze="0.15 0.25 0.35 1" />\n')
+        file.write('    <global azimuth="120" elevation="-20" />\n')
+        file.write('  </visual>\n')
+
+        file.write('  <default>\n')
+        file.write('    <default class="visual">\n')
+        file.write('      <geom contype="0" conaffinity="0" group="2" />\n')
+        file.write('    </default>\n')
+        file.write('    <default class="collision">\n')
+        file.write('      <geom group="3" />\n')
+        file.write('      </default>\n')
+        file.write('  </default>\n')
+
+        file.write('  <asset>\n')
+        file.write('    <texture type="skybox" file="assets/space.png" gridsize="3 4" gridlayout=".U..LFRB.D.."/>\n')
+        file.write('    <texture type="skybox" file="assets/space.png" gridsize="3 4" gridlayout=".U..LFRB.D.."/>\n')
+        file.write('  </asset>\n')
+
         file.write('  <worldbody>\n')
+
+        materials = []
+        materials_map = {}
+        closed_list = set()
+        for obj in selected_objects:
+            if obj.active_material:
+                mat = obj.active_material
+                if mat.name in closed_list:
+                    materials_map[obj.name] = mat.name
+                    continue
+
+                if mat and "Principled BSDF" in mat.node_tree.nodes:
+                    closed_list.add(mat.name)
+
+                    node = mat.node_tree.nodes["Principled BSDF"]
+                    texture = None
+                    base_color = None
+                    metallic = None
+                    roughness = None
+                    alpha = 1.0
+                    for ind in range(len(node.inputs)):
+                        input = node.inputs[ind]
+                        if input.name == "Base Color":
+                            base_color = input.default_value
+                        elif input.name == "Metallic":
+                            metallic = input.default_value
+                        elif input.name == "Roughness":
+                            roughness = input.default_value
+                        elif input.name == "Alpha":
+                            alpha = input.default_value
+
+                    if "Image Texture" in mat.node_tree.nodes:
+                        # new_mat = f'<material name="{mat.name}" rgba="{base_color[0]} {base_color[1]} {base_color[2]} 1.0" reflectance="{1.0-roughness}" metallic="{metallic}" />'
+                        new_texture = f'<texture type="2d" name="{mat.name}" file="assets/{mat.name}.png" mark="edge" width="2048" height="2048" />'
+                        new_mat = f'<material name="{mat.name}" texture="{mat.name}" texuniform="true" texrepeat="1 1" reflectance="{1.0 - roughness}" metallic="{metallic}" />'
+                        materials.append(new_texture)
+                        materials.append(new_mat)
+                    else:
+                        new_mat = f'<material name="{mat.name}" rgba="{base_color[0]} {base_color[1]} {base_color[2]} {alpha}" reflectance="{1.0 - roughness}" metallic="{metallic}" />'
+                        materials.append(new_mat)
+
+                    materials_map[obj.name] = mat.name
+                else:
+                    print(f'Skipping material: {obj.active_material.name} since it is not Principled BSDF')
 
         mesh_file_names = []
         # Write the bodies recursively
         for obj in selected_objects:
             if obj.parent is None:
-                mesh_file_names.extend(write_body(obj, file, 2, dir_path, export))
+                mesh_file_names.extend(write_body(obj, file, 2, dir_path, materials_map, export))
 
         # Write the closing tags for the XML
         file.write('  </worldbody>\n')
@@ -86,12 +151,13 @@ def write_mjcf(dir_path, model_file_name, selected_objects, export=False):
         mesh_elements = [f'\n    <mesh name="{os.path.splitext(filename)[0]}" file="{filename}"/>' for filename in
                          mesh_file_names]
         mesh_string = "".join(mesh_elements)
+        mesh_string += "\n".join([mat for mat in materials])
         asset_string = f"<asset>{mesh_string}\n  </asset>"
         file.write(asset_string)
         file.write('</mujoco>\n')
 
 
-def write_body(obj, file, level, dir_path, export=False):
+def write_body(obj, file, level, dir_path, materials_map, export=False):
     # Set the indentation for this level
     indent = "  " * level
     filepaths = []
@@ -127,7 +193,7 @@ def write_body(obj, file, level, dir_path, export=False):
             f'{indent}<body name="{obj.name}" pos="{pos[0]} {pos[1]} {pos[2]}" quat="{rot[0]} {rot[1]} {rot[2]} {rot[3]}">\n')
         mesh_dir = os.path.join(dir_path, 'mesh')
         os.makedirs(mesh_dir, exist_ok=True)
-        filepath = os.path.join(mesh_dir, f'{obj.name}.stl')
+        filepath = os.path.join(mesh_dir, f'{obj.name}.obj')
 
         if export:
             # Export the mesh to a separate STL file
@@ -137,22 +203,22 @@ def write_body(obj, file, level, dir_path, export=False):
             matrix_world = obj.matrix_world.copy()
             obj.matrix_world = mathutils.Matrix.Identity(4)
             obj.data.update()
-            bpy.ops.wm.stl_export(
-                filepath=filepath,
-                export_selected_objects=True,
-                apply_modifiers=False
-            )
+            bpy.ops.wm.obj_export(filepath=filepath, apply_modifiers=True, export_selected_objects=True,
+                                  global_scale=1.0, forward_axis='Y', up_axis='Z')
             obj.matrix_world = matrix_world
             obj.data.update()
 
         # Write the geom element for the object
-        file.write(f'{indent}  <geom type="mesh" name="{obj.name} geom" mesh="{obj.name}" />\n')
+        mat_str = f'material="{materials_map[obj.name]}"' if obj.name in materials_map else ""
+        collision_str = 'collision' if 'collision' in obj.name else 'visual'
+        file.write(
+            f'{indent}  <geom class="{collision_str}" type="mesh" name="{obj.name} geom" mesh="{obj.name}" {mat_str} />\n')
         filepaths.append(os.path.basename(filepath))
 
     child_file_paths = []
     # Recursively write the children
     for child in obj.children:
-        child_file_paths.extend(write_body(child, file, level + 1, dir_path, export))
+        child_file_paths.extend(write_body(child, file, level + 1, dir_path, materials_map, export))
 
     if obj.type == "MESH":
         file.write(f'{indent}</body>\n')
